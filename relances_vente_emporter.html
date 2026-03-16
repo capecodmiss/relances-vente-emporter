@@ -4,7 +4,6 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Relances — Vente à emporter</title>
-<!-- SDK Grist Widget (accès direct aux données, pas de clé API) -->
 <script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
@@ -18,7 +17,7 @@
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useState, useEffect } = React;
+const { useState, useEffect, useRef } = React;
 
 const STEPS = ["config","apercu","generation","envoi"];
 const stepLabels = { config:"1. Configuration", apercu:"2. Aperçu impayés", generation:"3. Génération mails", envoi:"4. Validation & envoi" };
@@ -26,7 +25,7 @@ const DELAI_JOURS = 10;
 const NIVEAU_CONFIG = {
   1:{ label:"1ère relance", couleur:"#1565c0", bg:"#e3f2fd", border:"#90caf9", emoji:"💙", ton:"courtois et bienveillant. C'est le premier rappel, la personne a peut-être simplement oublié." },
   2:{ label:"2ème relance", couleur:"#e65100", bg:"#fff3e0", border:"#ffcc80", emoji:"🟠", ton:"courtois mais plus insistant. Un premier rappel a déjà été envoyé sans réponse." },
-  3:{ label:"3ème relance", couleur:"#b71c1c", bg:"#ffebee", border:"#ef9a9a", emoji:"🔴", ton:"ferme et sérieux. Dernière relance avant transmission. Indiquer que sans réponse sous 8 jours, le dossier sera transmis." },
+  3:{ label:"3ème relance", couleur:"#b71c1c", bg:"#ffebee", border:"#ef9a9a", emoji:"🔴", ton:"ferme et sérieux. Dernière relance avant transmission. Sans réponse sous 8 jours, le dossier sera transmis." },
 };
 const CLAUDE_SYSTEM = (n, etab) => `Tu es un assistant administratif pour ${etab||"un EPLE français"}.
 Tu rédiges une relance de niveau ${n} sur 3 pour un impayé de vente à emporter.
@@ -39,10 +38,13 @@ const todayISO = () => new Date().toISOString().split("T")[0];
 
 function joursDepuis(v) {
   if (!v) return null;
-  // Grist stocke les dates en jours depuis epoch ou en string YYYY-MM-DD
   let d;
-  if (typeof v === "number") d = new Date(v * 86400000); // jours → ms
-  else d = new Date(v);
+  if (typeof v === "number") {
+    // Grist stocke les dates en nombre de jours depuis 1970-01-01
+    d = new Date(v * 86400000);
+  } else {
+    d = new Date(v);
+  }
   if (isNaN(d)) return null;
   return Math.floor((Date.now() - d.getTime()) / 86400000);
 }
@@ -98,27 +100,24 @@ const th={padding:"7px 10px",textAlign:"left",fontWeight:600,fontSize:11,color:"
 const td={padding:"7px 10px",fontSize:12};
 
 // ── Import Mails ──────────────────────────────────────────────
-function ImportMails({tableId, columns}) {
+function ImportMails({gristRecords, tableId, columns}) {
   const [mNom,setMNom]=useState(""); const [mEmail,setMEmail]=useState("");
   const [raw,setRaw]=useState(""); const [matched,setMatched]=useState(null);
-  const [loading,setLoading]=useState(false); const [status,setStatus]=useState(null); const [err,setErr]=useState("");
+  const [status,setStatus]=useState(null); const [err,setErr]=useState("");
 
-  const analyse=async()=>{
-    setLoading(true);setErr("");setMatched(null);setStatus(null);
+  const analyse=()=>{
     try{
-      const raw2=await grist.docApi.fetchTable(tableId);
-      const rows=raw2.id.map((id,i)=>{ const r={_gristId:id}; Object.keys(raw2).forEach(k=>{if(k!=="id")r[k]=raw2[k][i];}); return r; });
-      setMatched(matchNoms(rows,mNom,parseMailList(raw)));
-    }catch(e){setErr(e.message);}finally{setLoading(false);}
+      setMatched(matchNoms(gristRecords,mNom,parseMailList(raw)));
+    }catch(e){setErr(e.message);}
   };
 
   const confirm=async()=>{
     setStatus("loading");
     try{
-      const toUp=matched.filter(r=>r._gristId&&(r._matchedEmail||r._override));
-      await grist.docApi.applyUserActions([["BulkUpdateRecord",tableId,toUp.map(r=>r._gristId),{[mEmail]:toUp.map(r=>r._override||r._matchedEmail)}]]);
+      const toUp=matched.filter(r=>r.id&&(r._matchedEmail||r._override));
+      await grist.docApi.applyUserActions([["BulkUpdateRecord",tableId,toUp.map(r=>r.id),{[mEmail]:toUp.map(r=>r._override||r._matchedEmail)}]]);
       setStatus("ok");
-    }catch{setStatus("error");}
+    }catch(e){setErr(e.message);setStatus("error");}
   };
 
   const found=(matched?.filter(r=>r._matchedEmail||r._override).length)||0;
@@ -138,7 +137,7 @@ function ImportMails({tableId, columns}) {
         <Field label="Liste Nom : email (un par ligne)">
           <textarea rows={7} value={raw} onChange={e=>setRaw(e.target.value)} placeholder="Martin Sophie : s.martin@ac-toulouse.fr" style={{...iS,resize:"vertical",fontFamily:"monospace",lineHeight:1.5}}/>
         </Field>
-        <Btn onClick={analyse} loading={loading} disabled={!mNom||!mEmail||!raw.trim()}>🔍 Analyser →</Btn>
+        <Btn onClick={analyse} disabled={!mNom||!mEmail||!raw.trim()}>🔍 Analyser →</Btn>
       </Card>
 
       {matched&&<Card title="Résultats">
@@ -172,7 +171,9 @@ function App() {
   const [onglet,setOnglet]=useState("relances");
   const [step,setStep]=useState("config");
   const [gristReady,setGristReady]=useState(false);
+  const [gristRecords,setGristRecords]=useState([]); // données brutes de grist.onRecords
   const [tableId,setTableId]=useState("");
+  const [tables,setTables]=useState([]);
   const [columns,setColumns]=useState([]);
   const [etablissement,setEtablissement]=useState("");
   const [mapping,setMapping]=useState({nom:"",email:"",montant:"",statut:"",dateR1:"",dateR2:"",dateR3:""});
@@ -184,43 +185,44 @@ function App() {
   const [genProgress,setGenProgress]=useState(0);
   const [gristStatus,setGristStatus]=useState(null);
 
+  // ── Init Grist via onRecords (pas besoin de connaître l'ID) ──
   useEffect(()=>{
     try{
       grist.ready({requiredAccess:"full"});
-      grist.onRecord(()=>{}); // déclenche la connexion
+      // onRecords reçoit automatiquement les données de la table liée au widget
+      grist.onRecords((records, mappingInfo)=>{
+        if(!records||records.length===0) return;
+        // Extraire les colonnes depuis le premier enregistrement
+        const cols=Object.keys(records[0]).filter(k=>k!=="id"&&!k.startsWith("_"));
+        setColumns(cols);
+        setGristRecords(records);
+        setGristReady(true);
+        // Récupérer l'ID de la table via mappingInfo si disponible
+        if(mappingInfo && mappingInfo.tableId) setTableId(mappingInfo.tableId);
+      });
+      // Fallback: essayer de récupérer le tableId via getTable
+      grist.selectedTable.getTableId().then(tid=>{
+        setTableId(tid);
+      }).catch(()=>{});
       setGristReady(true);
     }catch(e){
-      console.warn("Grist SDK non disponible",e);
+      console.warn("Grist SDK:",e);
       setGristReady(false);
     }
   },[]);
 
-  const loadTable=async(tid)=>{
-    if(!tid)return;
-    setTableId(tid);setLoading(true);setError("");
-    try{
-      const raw=await grist.docApi.fetchTable(tid);
-      const cols=Object.keys(raw).filter(k=>k!=="id"&&!k.startsWith("_"));
-      setColumns(cols);
-    }catch(e){setError("Table introuvable : "+e.message);}finally{setLoading(false);}
-  };
-
-  const fetchRecords=async()=>{
-    setLoading(true);setError("");
-    try{
-      const raw=await grist.docApi.fetchTable(tableId);
-      const rows=raw.id.map((id,i)=>{ const r={_gristId:id}; Object.keys(raw).forEach(k=>{if(k!=="id")r[k]=raw[k][i];}); return r; });
-      const filtered=rows.filter(r=>{
-        if(!mapping.statut)return true;
-        const val=String(r[mapping.statut]||"").toLowerCase();
-        return filterStatut?val===filterStatut.toLowerCase():!["payé","paye","réglé","regle"].includes(val);
-      });
-      setImpayés(filtered.map((r,i)=>{
-        const info=detectNiveau(r,mapping.dateR1,mapping.dateR2,mapping.dateR3);
-        return{...r,_id:i,_selected:info!==null&&info.delaiOk,_niveau:info?.niveau??null,_delaiOk:info?.delaiOk??true,_joursRestants:info?.joursRestants??0,_mailManquant:!r[mapping.email]};
-      }));
-      setStep("apercu");
-    }catch(e){setError(e.message);}finally{setLoading(false);}
+  const buildImpayés=()=>{
+    setError("");
+    const filtered=gristRecords.filter(r=>{
+      if(!mapping.statut)return true;
+      const val=String(r[mapping.statut]||"").toLowerCase();
+      return filterStatut?val===filterStatut.toLowerCase():!["payé","paye","réglé","regle"].includes(val);
+    });
+    setImpayés(filtered.map((r,i)=>{
+      const info=detectNiveau(r,mapping.dateR1,mapping.dateR2,mapping.dateR3);
+      return{...r,_id:i,_selected:info!==null&&info.delaiOk,_niveau:info?.niveau??null,_delaiOk:info?.delaiOk??true,_joursRestants:info?.joursRestants??0,_mailManquant:!r[mapping.email]};
+    }));
+    setStep("apercu");
   };
 
   const generateEmails=async()=>{
@@ -242,13 +244,13 @@ function App() {
         });
         const data=await res.json();
         const bodyReel=deanonymise(data.content?.[0]?.text||"",reverse);
-        results.push({nom:nomReel,email:emailAddr,montant,niveau,body:bodyReel,_edited:bodyReel,_gristId:r._gristId,_sent:false});
+        results.push({nom:nomReel,email:emailAddr,montant,niveau,body:bodyReel,_edited:bodyReel,_gristId:r.id,_sent:false});
       }catch{
         const s=`\n\nCordialement,\nL'intendance${etablissement?" — "+etablissement:""}`;
         const tpl=niveau===1?`Bonjour ${nomReel},\n\nNous vous rappelons qu'un solde de ${montant} € reste dû.\n\nMerci de régulariser rapidement.${s}`
           :niveau===2?`Bonjour ${nomReel},\n\nMalgré notre précédent rappel, un solde de ${montant} € reste impayé.${s}`
           :`Bonjour ${nomReel},\n\nMalgré deux relances, le solde de ${montant} € demeure impayé. Sans régularisation sous 8 jours, le dossier sera transmis.${s}`;
-        results.push({nom:nomReel,email:emailAddr,montant,niveau,body:tpl,_edited:tpl,_gristId:r._gristId,_sent:false});
+        results.push({nom:nomReel,email:emailAddr,montant,niveau,body:tpl,_edited:tpl,_gristId:r.id,_sent:false});
       }
       setGenProgress(i+1);
     }
@@ -274,7 +276,7 @@ function App() {
       const actions=Object.entries(byCol).map(([col,{ids,vals}])=>["BulkUpdateRecord",tableId,ids,{[col]:vals}]);
       await grist.docApi.applyUserActions(actions);
       setGristStatus("ok");
-    }catch{setGristStatus("error");}
+    }catch(e){console.error(e);setGristStatus("error");}
   };
 
   const recommencer=()=>{setStep("config");setEmails([]);setImpayés([]);setGristStatus(null);};
@@ -313,19 +315,15 @@ function App() {
 
         <div style={{maxWidth:860,margin:"20px auto",padding:"0 20px"}}>
           {error&&<div style={{background:"#fff0f0",border:"1px solid #ffb3b3",borderRadius:8,padding:"10px 14px",marginBottom:16,color:"#c0392b",fontSize:13}}>⚠️ {error}</div>}
-          {!gristReady&&<div style={{background:"#fff3e0",border:"1px solid #ffcc80",borderRadius:8,padding:"10px 14px",marginBottom:16,color:"#e65100",fontSize:13}}>⏳ Connexion à Grist en cours…</div>}
 
           {step==="config"&&<Card title="Configuration">
-            <div style={{background:"#e3f2fd",border:"1px solid #90caf9",borderRadius:8,padding:"8px 14px",marginBottom:16,fontSize:12,color:"#1565c0"}}>
-              💡 L'app lit les données <strong>directement depuis Grist</strong> — aucune clé API nécessaire.
-            </div>
+            {!gristReady&&<div style={{background:"#fff3e0",border:"1px solid #ffcc80",borderRadius:8,padding:"10px 14px",marginBottom:16,fontSize:13,color:"#e65100"}}>⏳ En attente de connexion à Grist… Assurez-vous d'avoir accordé l'accès complet au widget.</div>}
+            {gristReady&&columns.length===0&&<div style={{background:"#fff3e0",border:"1px solid #ffcc80",borderRadius:8,padding:"10px 14px",marginBottom:16,fontSize:13,color:"#e65100"}}>⏳ En attente des données Grist… Cliquez sur une ligne de votre table.</div>}
+            {columns.length>0&&<div style={{background:"#e8f5e9",border:"1px solid #a5d6a7",borderRadius:8,padding:"8px 14px",marginBottom:16,fontSize:12,color:"#2e7d32"}}>
+              ✅ <strong>{columns.length} colonnes détectées</strong> depuis Grist : {columns.join(", ")}
+            </div>}
             <Field label="🏫 Nom de l'établissement">
               <input value={etablissement} onChange={e=>setEtablissement(e.target.value)} placeholder="Ex: Lycée Louis Bascan" style={iS}/>
-            </Field>
-            <Field label="Nom de la table Grist">
-              <input value={tableId} onChange={e=>setTableId(e.target.value)} onBlur={e=>loadTable(e.target.value.trim())} placeholder="Ex: Feuille1" style={iS}/>
-              <div style={{fontSize:11,color:"#5a7a9a",marginTop:3}}>Saisissez le nom exact visible en haut de votre vue Grist, puis appuyez sur Tab.</div>
-              {columns.length>0&&<div style={{marginTop:5,fontSize:11,color:"#1e7e34",fontWeight:600}}>✅ {columns.length} colonnes détectées</div>}
             </Field>
             {columns.length>0&&<>
               <p style={{fontSize:12,fontWeight:600,color:"#3a5068",margin:"12px 0 6px"}}>Associez les colonnes :</p>
@@ -334,14 +332,14 @@ function App() {
                   <select value={mapping[key]} onChange={e=>setMapping({...mapping,[key]:e.target.value})} style={iS}><option value="">—</option>{columns.map(c=><option key={c} value={c}>{c}</option>)}</select>
                 </Field>
               ))}
-              {mapping.statut&&<Field label="Valeur à filtrer"><input value={filterStatut} onChange={e=>setFilterStatut(e.target.value)} placeholder="Laisser vide = exclure payé/réglé" style={iS}/></Field>}
+              {mapping.statut&&<Field label="Valeur à filtrer (ex: impayé)"><input value={filterStatut} onChange={e=>setFilterStatut(e.target.value)} placeholder="Laisser vide = exclure payé/réglé" style={iS}/></Field>}
               <p style={{fontSize:12,fontWeight:600,color:"#5a7a9a",margin:"14px 0 6px"}}>Colonnes dates <span style={{background:"#fff3e0",color:"#e65100",fontSize:10,borderRadius:4,padding:"1px 5px",marginLeft:3}}>📅 {DELAI_JOURS}j</span></p>
               <div style={{background:"#f8f9fc",border:"1px solid #dde3ec",borderRadius:8,padding:12}}>
                 {[["dateR1","💙 Date 1ère relance *"],["dateR2","🟠 Date 2ème relance *"],["dateR3","🔴 Date 3ème relance *"]].map(([key,label])=>(
                   <Field key={key} label={label}><select value={mapping[key]} onChange={e=>setMapping({...mapping,[key]:e.target.value})} style={iS}><option value="">—</option>{columns.map(c=><option key={c} value={c}>{c}</option>)}</select></Field>
                 ))}
               </div>
-              <Btn onClick={fetchRecords} loading={loading} disabled={!mapping.nom||!mapping.email||!mapping.montant||!mapping.dateR1||!mapping.dateR2||!mapping.dateR3}>Charger les impayés →</Btn>
+              <Btn onClick={buildImpayés} disabled={!mapping.nom||!mapping.email||!mapping.montant||!mapping.dateR1||!mapping.dateR2||!mapping.dateR3}>Charger les impayés →</Btn>
             </>}
           </Card>}
 
@@ -429,7 +427,7 @@ function App() {
         </div>
       </>}
 
-      {onglet==="import"&&<ImportMails tableId={tableId} columns={columns}/>}
+      {onglet==="import"&&<ImportMails gristRecords={gristRecords} tableId={tableId} columns={columns}/>}
     </div>
   );
 }
