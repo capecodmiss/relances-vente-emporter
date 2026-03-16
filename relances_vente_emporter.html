@@ -37,20 +37,28 @@ function toNomPropre(s){
 }
 
 function gristDateToStr(v){
-  if(!v)return null;
+  if(v===null||v===undefined||v==="")return null;
   let d;
-  if(typeof v==="number")d=new Date(v*86400000);
-  else d=new Date(v);
-  if(isNaN(d))return null;
+  if(typeof v==="number"){
+    // Grist stocke les dates en secondes depuis epoch (Unix timestamp)
+    // Si la valeur est > 100000 c'est des secondes, sinon des jours (ancien format)
+    d = v > 100000 ? new Date(v*1000) : new Date(v*86400000);
+  } else {
+    d=new Date(v);
+  }
+  if(isNaN(d.getTime()))return null;
   return d.toLocaleDateString("fr-FR");
 }
 
 function joursDepuis(v){
-  if(!v)return null;
+  if(v===null||v===undefined||v==="")return null;
   let d;
-  if(typeof v==="number")d=new Date(v*86400000);
-  else d=new Date(v);
-  if(isNaN(d))return null;
+  if(typeof v==="number"){
+    d = v > 100000 ? new Date(v*1000) : new Date(v*86400000);
+  } else {
+    d=new Date(v);
+  }
+  if(isNaN(d.getTime()))return null;
   return Math.floor((Date.now()-d.getTime())/86400000);
 }
 
@@ -108,9 +116,11 @@ function buildSystem(niveau,etab,dateR1,dateR2){
   const sign=`Cordialement,\nLe Service Intendance${etab?" — "+etab:""}`;
   const coordBanc=`Pour rappel, voici les coordonnées bancaires du ${etabStr} :\nIBAN : ${IBAN}\nBIC : ${BIC}`;
 
+  const d1str=gristDateToStr(dateR1);
+  const d2str=gristDateToStr(dateR2);
   let instrDates="";
-  if(niveau===2&&dateR1)instrDates=`Un premier rappel a été envoyé le ${gristDateToStr(dateR1)} — mentionne cette date dans le mail.`;
-  if(niveau===3&&dateR1&&dateR2)instrDates=`Deux relances ont déjà été envoyées : le ${gristDateToStr(dateR1)} et le ${gristDateToStr(dateR2)} — mentionne ces dates.`;
+  if(niveau===2&&d1str)instrDates=`Un premier rappel a été envoyé le ${d1str} — mentionne cette date dans le mail.`;
+  if(niveau===3&&d1str)instrDates=`Deux relances ont déjà été envoyées : le ${d1str}${d2str?" et le "+d2str:""} — mentionne ces dates.`;
 
   const tons={
     1:"courtois et bienveillant. Premier rappel, la personne a peut-être oublié.",
@@ -140,9 +150,11 @@ function buildFallback(niveau,nomPropre,montant,etab,dateR1,dateR2){
   const coord=`\n\nPour rappel, coordonnées bancaires :\nIBAN : ${IBAN}\nBIC : ${BIC}`;
   if(niveau===1)
     return `Madame, Monsieur ${nomPropre},\n\nNous vous rappelons qu'un solde de ${montant} € reste dû au titre de la vente à emporter.\n\nMerci de procéder rapidement au règlement par virement.${coord}${sign}`;
+  const d1=gristDateToStr(dateR1);
+  const d2=gristDateToStr(dateR2);
   if(niveau===2)
-    return `Madame, Monsieur ${nomPropre},\n\nMalgré notre précédent rappel${dateR1?" du "+gristDateToStr(dateR1):""}, un solde de ${montant} € reste impayé.\n\nMerci de procéder rapidement au règlement par virement.${coord}${sign}`;
-  return `Madame, Monsieur ${nomPropre},\n\nMalgré deux relances${dateR1?" ("+gristDateToStr(dateR1)+(dateR2?" et "+gristDateToStr(dateR2):"")+")":""}, le solde de ${montant} € demeure impayé.\n\nSans régularisation sous 8 jours, ce dossier sera transmis au service compétent.\n\nMerci de procéder au règlement par virement.${coord}${sign}`;
+    return `Madame, Monsieur ${nomPropre},\n\nMalgré notre précédent rappel${d1?" du "+d1:""}, un solde de ${montant} € reste impayé.\n\nMerci de procéder rapidement au règlement par virement.${coord}${sign}`;
+  return `Madame, Monsieur ${nomPropre},\n\nMalgré deux relances${d1?" ("+d1+(d2?" et "+d2:"")+")":""}, le solde de ${montant} € demeure impayé.\n\nSans régularisation sous 8 jours, ce dossier sera transmis au service compétent.\n\nMerci de procéder au règlement par virement.${coord}${sign}`;
 }
 
 // ── Composants UI ─────────────────────────────────────────────
@@ -257,6 +269,21 @@ function App(){
     }catch(e){console.warn("Grist SDK:",e);setGristReady(false);}
   },[]);
 
+  const autoDetectMapping = (cols) => {
+    const find = (...keywords) => cols.find(c =>
+      keywords.some(k => c.toLowerCase().replace(/[_\s]/g,"").includes(k.toLowerCase().replace(/[_\s]/g,"")))
+    ) || "";
+    return {
+      nom:      find("nom","name","prenom","prénom"),
+      email:    find("mail","email","courriel","adresse"),
+      montant:  find("montant","solde","reste","somme","amount"),
+      statut:   find("statut","status","paye","payé","etat","état"),
+      dateR1:   find("date_r1","dater1","relance1","r1","date1"),
+      dateR2:   find("date_r2","dater2","relance2","r2","date2"),
+      dateR3:   find("date_r3","dater3","relance3","r3","date3"),
+    };
+  };
+
   const loadTable=async(tid)=>{
     if(!tid)return;
     setTableId(tid);setLoading(true);setError("");
@@ -264,6 +291,17 @@ function App(){
       const raw=await grist.docApi.fetchTable(tid);
       const cols=Object.keys(raw).filter(k=>k!=="id"&&!k.startsWith("_"));
       setColumns(cols);
+      // Auto-détection du mapping
+      const detected=autoDetectMapping(cols);
+      setMapping(prev=>({
+        nom:      detected.nom      || prev.nom,
+        email:    detected.email    || prev.email,
+        montant:  detected.montant  || prev.montant,
+        statut:   detected.statut   || prev.statut,
+        dateR1:   detected.dateR1   || prev.dateR1,
+        dateR2:   detected.dateR2   || prev.dateR2,
+        dateR3:   detected.dateR3   || prev.dateR3,
+      }));
     }catch(e){setError("Impossible de charger la table : "+e.message);}finally{setLoading(false);}
   };
 
