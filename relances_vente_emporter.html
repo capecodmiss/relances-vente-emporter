@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Relances — Vente à emporter</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Segoe UI', sans-serif; background: #f0f4f8; color: #1a2332; }
+  input, select, textarea, button { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState } = React;
+
+// ── Constantes ────────────────────────────────────────────────
+const RELANCE_STEPS = ["connexion","colonnes","apercu","generation","envoi"];
+const stepLabels = { connexion:"1. Connexion Grist", colonnes:"2. Mapping colonnes", apercu:"3. Aperçu impayés", generation:"4. Génération mails", envoi:"5. Validation & envoi" };
+const DELAI_JOURS = 10;
+const NIVEAU_CONFIG = {
+  1:{ label:"1ère relance", couleur:"#1565c0", bg:"#e3f2fd", border:"#90caf9", emoji:"💙",
+      ton:"courtois et bienveillant. C'est le premier rappel, la personne a peut-être simplement oublié." },
+  2:{ label:"2ème relance", couleur:"#e65100", bg:"#fff3e0", border:"#ffcc80", emoji:"🟠",
+      ton:"courtois mais plus insistant. Un premier rappel a déjà été envoyé sans réponse." },
+  3:{ label:"3ème relance", couleur:"#b71c1c", bg:"#ffebee", border:"#ef9a9a", emoji:"🔴",
+      ton:"ferme et sérieux. Dernière relance avant transmission. Indiquer que sans réponse sous 8 jours, le dossier sera transmis." },
+};
+const CLAUDE_SYSTEM = (n, etab) => `Tu es un assistant administratif pour ${etab || "un établissement scolaire public français (EPLE)"}.
+Tu rédiges une relance de niveau ${n} sur 3 pour un impayé de vente à emporter.
+Ton : ${NIVEAU_CONFIG[n].ton}
+Termine TOUJOURS le mail par la signature suivante, sur une nouvelle ligne : "Cordialement,\nL'intendance${etab ? " — " + etab : ""}".
+Réponds UNIQUEMENT avec le corps du mail, sans objet, sans balises.`;
+
+// ── Utilitaires ───────────────────────────────────────────────
+const normalize = s => String(s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z0-9 ]/g,"").trim();
+const today = () => new Date().toLocaleDateString("fr-FR");
+const todayISO = () => new Date().toISOString().split("T")[0];
+
+function joursDepuis(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (isNaN(d)) return null;
+  return Math.floor((Date.now() - d.getTime()) / 86400000);
+}
+function buildAnonymMap(records, nomKey) {
+  const map={}, reverse={};
+  records.forEach((r,i) => { const nom=String(r[nomKey]||""); map[nom]=`Personne_${i+1}`; reverse[`Personne_${i+1}`]=nom; });
+  return { map, reverse };
+}
+function deanonymise(text, reverse) {
+  let out=text; Object.entries(reverse).forEach(([p,r])=>{ out=out.replaceAll(p,r); }); return out;
+}
+function detectNiveau(r, c1, c2, c3) {
+  if (!r[c1]) return { niveau:1, delaiOk:true, joursRestants:0, derniereDate:null };
+  const j1 = joursDepuis(r[c1]);
+  if (!r[c2]) return { niveau:2, delaiOk:j1===null||j1>=DELAI_JOURS, joursRestants:j1===null?0:Math.max(0,DELAI_JOURS-j1), derniereDate:r[c1] };
+  const j2 = joursDepuis(r[c2]);
+  if (!r[c3]) return { niveau:3, delaiOk:j2===null||j2>=DELAI_JOURS, joursRestants:j2===null?0:Math.max(0,DELAI_JOURS-j2), derniereDate:r[c2] };
+  return null;
+}
+function parseMailList(text) {
+  const emailRe = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
+  return text.split("\n").map(l=>l.trim()).filter(Boolean).map(line => {
+    const m = line.match(emailRe); if(!m) return null;
+    const nom = line.replace(m[0],"").replace(/[:;,\t|]/g,"").trim();
+    return nom ? { nom, email:m[0] } : null;
+  }).filter(Boolean);
+}
+function matchNoms(recs, nomKey, parsed) {
+  return recs.map(r => {
+    const nomG = normalize(r[nomKey]);
+    let best=null, bestScore=0;
+    for (const p of parsed) {
+      const nomP=normalize(p.nom), wG=nomG.split(" ").filter(Boolean), wP=nomP.split(" ").filter(Boolean);
+      const score=wG.filter(w=>wP.includes(w)).length/Math.max(wG.length,wP.length);
+      if(score>bestScore){ bestScore=score; best=p; }
+    }
+    return { ...r, _matchedEmail:bestScore>=0.5?best?.email:null, _matchNom:bestScore>=0.5?best?.nom:null, _override:"" };
+  });
+}
+
+// ── Composants UI ─────────────────────────────────────────────
+const Badge = ({ niveau }) => { const c=NIVEAU_CONFIG[niveau]; return <span style={{ background:c.bg,color:c.couleur,border:`1px solid ${c.border}`,borderRadius:12,padding:"2px 10px",fontSize:11,fontWeight:700 }}>{c.emoji} {c.label}</span>; };
+const Pill = ({ color, text }) => <span style={{ background:color,color:"white",borderRadius:20,padding:"4px 12px",fontSize:12,fontWeight:600,whiteSpace:"nowrap" }}>{text}</span>;
+function Card({ title, children }) { return <div style={{ background:"white",borderRadius:12,boxShadow:"0 2px 12px rgba(0,49,137,0.08)",padding:"28px 32px",marginBottom:24 }}><h2 style={{ margin:"0 0 20px",fontSize:18,fontWeight:700,color:"#003189",borderBottom:"2px solid #e8edf3",paddingBottom:12 }}>{title}</h2>{children}</div>; }
+function Field({ label, children }) { return <div style={{ marginBottom:14 }}><label style={{ display:"block",fontSize:13,fontWeight:600,color:"#3a5068",marginBottom:5 }}>{label}</label>{children}</div>; }
+function Btn({ onClick, disabled, loading, color, children }) { const bg=disabled||loading?"#a0b4c8":(color||"#003189"); return <button onClick={onClick} disabled={disabled||loading} style={{ marginTop:8,background:bg,color:"white",border:"none",borderRadius:8,padding:"11px 24px",fontSize:14,cursor:disabled||loading?"default":"pointer",fontWeight:700 }}>{loading?"Chargement…":children}</button>; }
+const inputStyle = { width:"100%",border:"1px solid #c5d0dd",borderRadius:6,padding:"9px 12px",fontSize:14,fontFamily:"inherit",boxSizing:"border-box" };
+const th = { padding:"8px 12px",textAlign:"left",fontWeight:600,fontSize:12,color:"#5a7a9a",textTransform:"uppercase" };
+const td = { padding:"8px 12px",fontSize:13 };
+
+// ── Onglet Import Mails ───────────────────────────────────────
+function ImportMails({ config, tables, columns, fetchColumns, selectedTable, setSelectedTable }) {
+  const [mappingNom,setMappingNom]=useState(""); const [mappingEmail,setMappingEmail]=useState("");
+  const [rawText,setRawText]=useState(""); const [matchedRecords,setMatchedRecords]=useState(null);
+  const [loading,setLoading]=useState(false); const [updateStatus,setUpdateStatus]=useState(null); const [error,setError]=useState("");
+  const colOptions=columns.map(c=>c.id);
+
+  const handleAnalyse = async () => {
+    setLoading(true); setError(""); setMatchedRecords(null); setUpdateStatus(null);
+    try {
+      const res=await fetch(`${config.baseUrl}/api/docs/${config.docId}/tables/${selectedTable}/records`,{ headers:{Authorization:`Bearer ${config.apiKey}`} });
+      if(!res.ok) throw new Error(`Erreur ${res.status}`);
+      const data=await res.json();
+      const recs=(data.records||[]).map(r=>({...r.fields,_gristId:r.id}));
+      setMatchedRecords(matchNoms(recs,mappingNom,parseMailList(rawText)));
+    } catch(e){ setError(e.message); } finally{ setLoading(false); }
+  };
+
+  const handleConfirm = async () => {
+    setUpdateStatus("loading");
+    try {
+      const records=matchedRecords.filter(r=>r._gristId&&(r._matchedEmail||r._override)).map(r=>({ id:r._gristId, fields:{[mappingEmail]:r._override||r._matchedEmail} }));
+      const res=await fetch(`${config.baseUrl}/api/docs/${config.docId}/tables/${selectedTable}/records`,{ method:"PATCH", headers:{Authorization:`Bearer ${config.apiKey}`,"Content-Type":"application/json"}, body:JSON.stringify({records}) });
+      if(!res.ok) throw new Error(); setUpdateStatus("ok");
+    } catch{ setUpdateStatus("error"); }
+  };
+
+  const trouvés=(matchedRecords?.filter(r=>r._matchedEmail||r._override).length)||0;
+  const nonTrouvés=(matchedRecords?.filter(r=>!r._matchedEmail&&!r._override).length)||0;
+
+  return (
+    <div style={{ maxWidth:860,margin:"32px auto",padding:"0 24px" }}>
+      {error && <div style={{ background:"#fff0f0",border:"1px solid #ffb3b3",borderRadius:8,padding:"12px 16px",marginBottom:20,color:"#c0392b",fontSize:14 }}>⚠️ {error}</div>}
+      <Card title="📧 Import des adresses mail dans Grist">
+        <div style={{ background:"#e8f5e9",border:"1px solid #a5d6a7",borderRadius:8,padding:"10px 16px",marginBottom:20,fontSize:13,color:"#2e7d32" }}>
+          🛡️ <strong>Traitement 100% local</strong> — matching dans votre navigateur, aucune donnée vers une IA.
+        </div>
+        <Field label="Table Grist">
+          <select value={selectedTable} onChange={e=>fetchColumns(e.target.value)} style={inputStyle}>
+            <option value="">— choisir —</option>{tables.map(t=><option key={t.id} value={t.id}>{t.id}</option>)}
+          </select>
+        </Field>
+        {columns.length>0 && <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:12 }}>
+          <Field label="Colonne Nom / Prénom *"><select value={mappingNom} onChange={e=>setMappingNom(e.target.value)} style={inputStyle}><option value="">— colonne —</option>{colOptions.map(c=><option key={c} value={c}>{c}</option>)}</select></Field>
+          <Field label="Colonne Mail à remplir *"><select value={mappingEmail} onChange={e=>setMappingEmail(e.target.value)} style={inputStyle}><option value="">— colonne —</option>{colOptions.map(c=><option key={c} value={c}>{c}</option>)}</select></Field>
+        </div>}
+        <Field label="Colle ta liste Nom Prénom : email">
+          <div style={{ background:"#f8f9fc",border:"1px solid #dde3ec",borderRadius:6,padding:"8px 12px",marginBottom:6,fontSize:11,color:"#5a7a9a" }}>
+            Format : <code>Martin Sophie : s.martin@ac-toulouse.fr</code>
+          </div>
+          <textarea rows={8} value={rawText} onChange={e=>setRawText(e.target.value)} placeholder={"Martin Sophie : s.martin@ac-toulouse.fr\nDupont Jean : j.dupont@ac-toulouse.fr"} style={{ ...inputStyle,resize:"vertical",lineHeight:1.6,fontFamily:"monospace",fontSize:13 }} />
+        </Field>
+        <Btn onClick={handleAnalyse} loading={loading} disabled={!selectedTable||!mappingNom||!mappingEmail||!rawText.trim()}>🔍 Analyser et matcher →</Btn>
+      </Card>
+
+      {matchedRecords && <Card title="Résultats du matching">
+        <div style={{ display:"flex",gap:12,marginBottom:20,flexWrap:"wrap" }}>
+          <div style={{ background:"#e8f5e9",border:"1px solid #a5d6a7",borderRadius:8,padding:"10px 16px",fontSize:13 }}><span style={{ fontWeight:700,color:"#1e7e34" }}>✅ {trouvés} trouvé(s)</span></div>
+          {nonTrouvés>0 && <div style={{ background:"#fff3e0",border:"1px solid #ffcc80",borderRadius:8,padding:"10px 16px",fontSize:13 }}><span style={{ fontWeight:700,color:"#e65100" }}>⚠️ {nonTrouvés} à saisir manuellement</span></div>}
+        </div>
+        <table style={{ width:"100%",borderCollapse:"collapse",fontSize:13 }}>
+          <thead><tr style={{ background:"#e8edf3" }}><th style={th}>Nom Grist</th><th style={th}>Nom détecté</th><th style={th}>Mail</th><th style={th}>✓</th></tr></thead>
+          <tbody>{matchedRecords.map((r,i)=>(
+            <tr key={i} style={{ borderBottom:"1px solid #e8edf3" }}>
+              <td style={{ ...td,fontWeight:600 }}>{r[mappingNom]}</td>
+              <td style={{ ...td,color:r._matchNom?"#1e7e34":"#ccc" }}>{r._matchNom||"—"}</td>
+              <td style={td}>{r._matchedEmail
+                ? <span style={{ color:"#1565c0",fontFamily:"monospace" }}>{r._matchedEmail}</span>
+                : <input placeholder="Saisir…" value={r._override} onChange={ev=>setMatchedRecords(matchedRecords.map((x,j)=>j===i?{...x,_override:ev.target.value}:x))} style={{ border:"1px solid #ffcc80",borderRadius:4,padding:"4px 8px",fontSize:12,width:"100%",boxSizing:"border-box" }} />}
+              </td>
+              <td style={td}>{r._matchedEmail||r._override?<span style={{ color:"#1e7e34" }}>✅</span>:<span style={{ color:"#e65100" }}>⚠️</span>}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+        <div style={{ marginTop:20,borderTop:"2px dashed #c5d0dd",paddingTop:20 }}>
+          <div style={{ fontSize:13,color:"#5a7a9a",marginBottom:12 }}>{trouvés} mail(s) → colonne <code style={{ background:"#eee",padding:"1px 6px",borderRadius:3 }}>{mappingEmail}</code></div>
+          {updateStatus==="ok" && <div style={{ background:"#e8f5e9",border:"1px solid #a5d6a7",borderRadius:8,padding:"12px 16px",fontSize:14,color:"#1e7e34",fontWeight:600,marginBottom:12 }}>✅ {trouvés} adresse(s) enregistrée(s) dans Grist !</div>}
+          {updateStatus==="error" && <div style={{ background:"#fff0f0",border:"1px solid #ffb3b3",borderRadius:8,padding:"12px 16px",fontSize:14,color:"#c0392b",marginBottom:12 }}>⚠️ Erreur mise à jour.</div>}
+          <Btn onClick={handleConfirm} color="#1e7e34" disabled={trouvés===0||updateStatus==="ok"} loading={updateStatus==="loading"}>📥 Enregistrer {trouvés} mail(s) dans Grist</Btn>
+        </div>
+      </Card>}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  APPLICATION PRINCIPALE
+// ═══════════════════════════════════════════════════════════════
+function App() {
+  const [onglet,setOnglet]=useState("relances");
+  const [step,setStep]=useState("connexion");
+  const [config,setConfig]=useState({ apiKey:"", docId:"", baseUrl:"https://grist.numerique.gouv.fr", etablissement:"", rawUrl:"" });
+  const [tables,setTables]=useState([]); const [selectedTable,setSelectedTable]=useState(""); const [columns,setColumns]=useState([]);
+  const [mapping,setMapping]=useState({ nom:"",email:"",montant:"",statut:"",dateR1:"",dateR2:"",dateR3:"" });
+  const [filterStatut,setFilterStatut]=useState("");
+  const [impayés,setImpayés]=useState([]); const [emails,setEmails]=useState([]);
+  const [loading,setLoading]=useState(false); const [error,setError]=useState("");
+  const [generationProgress,setGenerationProgress]=useState(0); const [gristUpdateStatus,setGristUpdateStatus]=useState(null);
+
+  const fetchTables = async () => {
+    setLoading(true); setError("");
+    try {
+      const res=await fetch(`${config.baseUrl}/api/docs/${config.docId}/tables`,{ headers:{Authorization:`Bearer ${config.apiKey}`} });
+      if(!res.ok) throw new Error(`Erreur ${res.status} — vérifiez la clé API et l'ID`);
+      const data=await res.json(); setTables(data.tables||[]); setStep("colonnes");
+    } catch(e){ setError(e.message); } finally{ setLoading(false); }
+  };
+
+  const fetchColumns = async (tableId) => {
+    setSelectedTable(tableId); setLoading(true);
+    try {
+      const res=await fetch(`${config.baseUrl}/api/docs/${config.docId}/tables/${tableId}/columns`,{ headers:{Authorization:`Bearer ${config.apiKey}`} });
+      const data=await res.json(); setColumns(data.columns||[]);
+    } catch(e){ setError(e.message); } finally{ setLoading(false); }
+  };
+
+  const fetchRecords = async () => {
+    setLoading(true); setError("");
+    try {
+      const res=await fetch(`${config.baseUrl}/api/docs/${config.docId}/tables/${selectedTable}/records`,{ headers:{Authorization:`Bearer ${config.apiKey}`} });
+      const data=await res.json();
+      const recs=(data.records||[]).map(r=>({...r.fields,_gristId:r.id}));
+      const filtered=recs.filter(r=>{
+        if(!mapping.statut) return true;
+        const val=String(r[mapping.statut]||"").toLowerCase();
+        return filterStatut?val===filterStatut.toLowerCase():!["payé","paye","réglé","regle"].includes(val);
+      });
+      setImpayés(filtered.map((r,i)=>{
+        const info=detectNiveau(r,mapping.dateR1,mapping.dateR2,mapping.dateR3);
+        return { ...r, _id:i, _selected:info!==null&&info.delaiOk, _niveau:info?.niveau??null, _delaiOk:info?.delaiOk??true, _joursRestants:info?.joursRestants??0, _mailManquant:!r[mapping.email] };
+      }));
+      setStep("apercu");
+    } catch(e){ setError(e.message); } finally{ setLoading(false); }
+  };
+
+  const generateEmails = async () => {
+    const selected=impayés.filter(r=>r._selected&&r._niveau!==null);
+    const { map,reverse }=buildAnonymMap(selected,mapping.nom);
+    setLoading(true); setGenerationProgress(0); setEmails([]); setStep("generation");
+    const results=[];
+    for(let i=0;i<selected.length;i++){
+      const r=selected[i];
+      const nomReel=String(r[mapping.nom]||"Madame/Monsieur");
+      const nomAnon=map[nomReel]||`Personne_${i+1}`;
+      const montant=r[mapping.montant]||"?"; const emailAddr=r[mapping.email]||""; const niveau=r._niveau;
+      try {
+        const res=await fetch("https://api.anthropic.com/v1/messages",{
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:1000, system:CLAUDE_SYSTEM(niveau,config.etablissement), messages:[{ role:"user", content:`Rédige la relance n°${niveau} pour ${nomAnon}, montant dû : ${montant} €.` }] }),
+        });
+        const data=await res.json();
+        const bodyReel=deanonymise(data.content?.[0]?.text||"",reverse);
+        results.push({ nom:nomReel,email:emailAddr,montant,niveau,body:bodyReel,_edited:bodyReel,_gristId:r._gristId,_sent:false });
+      } catch {
+        const etabSuffix=config.etablissement?" — "+config.etablissement:"";
+        const sign=`\n\nCordialement,\nL'intendance${etabSuffix}`;
+        const tpl=niveau===1?`Bonjour ${nomReel},\n\nNous vous rappelons qu'un solde de ${montant} € reste dû au titre de la vente à emporter.\n\nMerci de régulariser rapidement.${sign}`
+          :niveau===2?`Bonjour ${nomReel},\n\nMalgré notre précédent rappel, un solde de ${montant} € reste impayé. Merci de procéder au règlement sans délai.${sign}`
+          :`Bonjour ${nomReel},\n\nMalgré deux relances, le solde de ${montant} € demeure impayé. Sans régularisation sous 8 jours, ce dossier sera transmis au service compétent.${sign}`;
+        results.push({ nom:nomReel,email:emailAddr,montant,niveau,body:tpl,_edited:tpl,_gristId:r._gristId,_sent:false });
+      }
+      setGenerationProgress(i+1);
+    }
+    setEmails(results); setStep("envoi"); setLoading(false);
+  };
+
+  const openMailto=(e,i)=>{
+    const etabSuffix=config.etablissement?" – "+config.etablissement:"";
+    window.open(`mailto:${e.email}?subject=${encodeURIComponent(`Relance paiement (${NIVEAU_CONFIG[e.niveau]?.label}) – Vente à emporter${etabSuffix}`)}&body=${encodeURIComponent(e._edited)}`);
+    setEmails(prev=>prev.map((x,j)=>j===i?{...x,_sent:true}:x));
+  };
+
+  const confirmerDansGrist = async () => {
+    setGristUpdateStatus("loading");
+    try {
+      const records=emails.filter(e=>e._gristId).map(e=>({ id:e._gristId, fields:{ [e.niveau===1?mapping.dateR1:e.niveau===2?mapping.dateR2:mapping.dateR3]:todayISO() } }));
+      const res=await fetch(`${config.baseUrl}/api/docs/${config.docId}/tables/${selectedTable}/records`,{ method:"PATCH", headers:{Authorization:`Bearer ${config.apiKey}`,"Content-Type":"application/json"}, body:JSON.stringify({records}) });
+      if(!res.ok) throw new Error(); setGristUpdateStatus("ok");
+    } catch{ setGristUpdateStatus("error"); }
+  };
+
+  const colOptions=columns.map(c=>c.id);
+  const selectedCount=impayés.filter(r=>r._selected&&r._niveau!==null).length;
+  const connected=tables.length>0;
+  const montantTotal=impayés.filter(r=>r._selected&&r._niveau!==null).reduce((acc,r)=>acc+(parseFloat(r[mapping.montant])||0),0);
+  const mailsManquants=impayés.filter(r=>r._mailManquant&&r._niveau!==null);
+  const horsDélai=impayés.filter(r=>r._niveau!==null&&!r._delaiOk);
+
+  const recommencer = () => { setStep("connexion"); setEmails([]); setImpayés([]); setGristUpdateStatus(null); };
+
+  return (
+    <div style={{ minHeight:"100vh",background:"#f0f4f8" }}>
+      {/* Header */}
+      <div style={{ background:"#003189",color:"white",padding:"16px 32px",display:"flex",alignItems:"center",gap:16 }}>
+        <div style={{ fontSize:28 }}>📬</div>
+        <div>
+          <div style={{ fontWeight:700,fontSize:18 }}>Relances — Vente à emporter{config.etablissement&&` · ${config.etablissement}`}</div>
+          <div style={{ fontSize:12,opacity:0.75 }}>3 niveaux · Délai {DELAI_JOURS}j · Intendance EPLE</div>
+        </div>
+        <div style={{ marginLeft:"auto",background:"#1e7e34",borderRadius:20,padding:"5px 14px",fontSize:12,fontWeight:600 }}>🛡️ Protection RGPD</div>
+      </div>
+      <div style={{ background:"#e8f5e9",borderBottom:"1px solid #a5d6a7",padding:"8px 32px",fontSize:12,color:"#2e7d32" }}>
+        🔒 <strong>Noms et mails anonymisés</strong> avant envoi à l'IA · Import mails : traitement 100% local dans le navigateur
+      </div>
+
+      {/* Onglets */}
+      <div style={{ background:"#001f6b",display:"flex",padding:"0 32px" }}>
+        {[["relances","📨 Relances"],["import","📧 Import mails"]].map(([key,label])=>(
+          <button key={key} onClick={()=>setOnglet(key)} style={{ padding:"12px 24px",fontSize:13,fontWeight:onglet===key?700:400,color:onglet===key?"white":"rgba(255,255,255,0.6)",background:onglet===key?"rgba(255,255,255,0.15)":"transparent",border:"none",borderBottom:onglet===key?"3px solid white":"3px solid transparent",cursor:"pointer",transition:"all 0.2s" }}>{label}</button>
+        ))}
+      </div>
+
+      {/* ── ONGLET RELANCES ── */}
+      {onglet==="relances" && <>
+        <div style={{ background:"#e8edf3",borderBottom:"1px solid #c5d0dd",padding:"0 32px",display:"flex",overflowX:"auto" }}>
+          {RELANCE_STEPS.map((s,i)=>(
+            <div key={s} style={{ padding:"10px 16px",fontSize:12,fontWeight:step===s?700:400,color:step===s?"#003189":RELANCE_STEPS.indexOf(step)>i?"#5a7a9a":"#aab5c3",borderBottom:step===s?"3px solid #003189":"3px solid transparent",whiteSpace:"nowrap" }}>{stepLabels[s]}</div>
+          ))}
+        </div>
+
+        <div style={{ maxWidth:860,margin:"32px auto",padding:"0 24px" }}>
+          {error && <div style={{ background:"#fff0f0",border:"1px solid #ffb3b3",borderRadius:8,padding:"12px 16px",marginBottom:20,color:"#c0392b",fontSize:14 }}>⚠️ {error}</div>}
+
+          {step==="connexion" && <Card title="Connexion à Grist">
+            <p style={{ fontSize:14,color:"#5a7a9a",marginBottom:20 }}>Renseignez vos informations de connexion et le nom de votre établissement.</p>
+            <Field label="🏫 Nom de l'établissement">
+              <input value={config.etablissement} onChange={e=>setConfig({...config,etablissement:e.target.value})} placeholder="Ex: Lycée Jean Jaurès — Toulouse" style={inputStyle} />
+              <div style={{ fontSize:11,color:"#5a7a9a",marginTop:4 }}>Apparaîtra dans la signature des mails et l'objet Outlook.</div>
+            </Field>
+            <Field label="🔗 URL de votre document Grist">
+              <input value={config.rawUrl||""} onChange={e=>{
+                const url=e.target.value.trim();
+                let baseUrl="", docId="";
+                try {
+                  const u=new URL(url);
+                  baseUrl=u.origin;
+                  const parts=u.pathname.split("/").filter(Boolean);
+                  const idx=parts.findIndex(p=>p==="docs");
+                  if(idx>=0 && parts[idx+1]) docId=parts[idx+1];
+                  else docId=parts.find(p=>p.match(/^[a-zA-Z0-9]{8,}$/)&&!["docs","api","o"].includes(p))||"";
+                } catch{}
+                setConfig({...config,rawUrl:url,baseUrl,docId});
+              }} placeholder="Collez l'URL complète de votre document Grist" style={inputStyle} />
+              {config.docId&&<div style={{ marginTop:6,fontSize:12,background:"#e8f5e9",border:"1px solid #a5d6a7",borderRadius:6,padding:"6px 10px",color:"#2e7d32" }}>
+                ✅ ID détecté : <strong>{config.docId}</strong> · Serveur : <strong>{config.baseUrl}</strong>
+              </div>}
+              {config.rawUrl&&!config.docId&&<div style={{ marginTop:6,fontSize:12,background:"#fff0f0",border:"1px solid #ffb3b3",borderRadius:6,padding:"6px 10px",color:"#c0392b" }}>
+                ⚠️ ID non détecté — vérifiez l'URL
+              </div>}
+            </Field>
+            <Field label="Clé API Grist">
+              <input type="password" value={config.apiKey} onChange={e=>setConfig({...config,apiKey:e.target.value})} placeholder="Votre clé API" style={inputStyle} />
+              <div style={{ fontSize:11,color:"#5a7a9a",marginTop:4 }}>Avatar en haut à droite → Paramètres du profil → API</div>
+            </Field>
+            <Btn onClick={fetchTables} loading={loading} disabled={!config.apiKey||!config.docId}>Connexion →</Btn>
+          </Card>}
+
+          {step==="colonnes" && <Card title="Configuration des colonnes">
+            <Field label="Table à utiliser">
+              <select value={selectedTable} onChange={e=>fetchColumns(e.target.value)} style={inputStyle}>
+                <option value="">— choisir —</option>{tables.map(t=><option key={t.id} value={t.id}>{t.id}</option>)}
+              </select>
+            </Field>
+            {columns.length>0 && <>
+              {[["nom","Nom / Prénom *",true],["email","Adresse mail *",true],["montant","Montant dû *",false],["statut","Statut (optionnel)",false]].map(([key,label,anon])=>(
+                <Field key={key} label={<span>{label}{anon&&<span style={{ background:"#e8f5e9",color:"#2e7d32",fontSize:10,borderRadius:4,padding:"2px 6px",marginLeft:6,fontWeight:600 }}>🛡️ anonymisé</span>}</span>}>
+                  <select value={mapping[key]} onChange={e=>setMapping({...mapping,[key]:e.target.value})} style={inputStyle}><option value="">— colonne —</option>{colOptions.map(c=><option key={c} value={c}>{c}</option>)}</select>
+                </Field>
+              ))}
+              {mapping.statut && <Field label="Valeur à filtrer (ex: impayé)"><input value={filterStatut} onChange={e=>setFilterStatut(e.target.value)} placeholder="Laisser vide = exclure payé/réglé" style={inputStyle} /></Field>}
+              <p style={{ fontSize:13,fontWeight:600,color:"#5a7a9a",margin:"20px 0 8px" }}>Colonnes dates <span style={{ background:"#fff3e0",color:"#e65100",fontSize:10,borderRadius:4,padding:"2px 6px",marginLeft:4 }}>📅 mise à jour auto · délai {DELAI_JOURS}j</span></p>
+              <div style={{ background:"#f8f9fc",border:"1px solid #dde3ec",borderRadius:8,padding:14 }}>
+                <p style={{ fontSize:12,color:"#5a7a9a",margin:"0 0 10px" }}>Le niveau de relance est détecté automatiquement selon ces colonnes.</p>
+                {[["dateR1","💙 Date 1ère relance *"],["dateR2","🟠 Date 2ème relance *"],["dateR3","🔴 Date 3ème relance *"]].map(([key,label])=>(
+                  <Field key={key} label={label}><select value={mapping[key]} onChange={e=>setMapping({...mapping,[key]:e.target.value})} style={inputStyle}><option value="">— colonne —</option>{colOptions.map(c=><option key={c} value={c}>{c}</option>)}</select></Field>
+                ))}
+              </div>
+              <Btn onClick={fetchRecords} loading={loading} disabled={!mapping.nom||!mapping.email||!mapping.montant||!mapping.dateR1||!mapping.dateR2||!mapping.dateR3}>Charger les impayés →</Btn>
+            </>}
+          </Card>}
+
+          {step==="apercu" && <Card title={`${impayés.length} impayé(s) trouvé(s)`}>
+            <div style={{ display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:20 }}>
+              <div style={{ background:"#e3f2fd",border:"1px solid #90caf9",borderRadius:10,padding:"14px 18px",textAlign:"center" }}>
+                <div style={{ fontSize:22,fontWeight:800,color:"#1565c0" }}>{impayés.length}</div>
+                <div style={{ fontSize:12,color:"#5a7a9a",marginTop:2 }}>impayé(s) total</div>
+              </div>
+              <div style={{ background:"#fff3e0",border:"1px solid #ffcc80",borderRadius:10,padding:"14px 18px",textAlign:"center" }}>
+                <div style={{ fontSize:22,fontWeight:800,color:"#e65100" }}>{montantTotal.toFixed(2)} €</div>
+                <div style={{ fontSize:12,color:"#5a7a9a",marginTop:2 }}>montant sélectionné</div>
+              </div>
+              <div style={{ background:selectedCount>0?"#e8f5e9":"#f5f5f5",border:`1px solid ${selectedCount>0?"#a5d6a7":"#ddd"}`,borderRadius:10,padding:"14px 18px",textAlign:"center" }}>
+                <div style={{ fontSize:22,fontWeight:800,color:selectedCount>0?"#1e7e34":"#999" }}>{selectedCount}</div>
+                <div style={{ fontSize:12,color:"#5a7a9a",marginTop:2 }}>relance(s) à envoyer</div>
+              </div>
+            </div>
+            {mailsManquants.length>0 && <div style={{ background:"#fff3e0",border:"1px solid #ffcc80",borderRadius:8,padding:"10px 16px",marginBottom:12,fontSize:13,color:"#e65100" }}>
+              ⚠️ <strong>{mailsManquants.length} personne(s) sans adresse mail</strong> : {mailsManquants.map(r=>r[mapping.nom]).join(", ")} — utilisez l'onglet <strong>Import mails</strong>.
+            </div>}
+            {horsDélai.length>0 && <div style={{ background:"#fff8e1",border:"1px solid #ffe082",borderRadius:8,padding:"10px 16px",marginBottom:12,fontSize:13,color:"#f57f17" }}>
+              🕐 <strong>{horsDélai.length} personne(s)</strong> avec délai de {DELAI_JOURS}j non écoulé — décochées par défaut, vous pouvez les forcer.
+            </div>}
+            <div style={{ display:"flex",gap:10,marginBottom:16,flexWrap:"wrap" }}>
+              {[1,2,3].map(n=>{ const c=NIVEAU_CONFIG[n]; const count=impayés.filter(r=>r._niveau===n).length;
+                return count>0&&<div key={n} style={{ background:c.bg,border:`1px solid ${c.border}`,borderRadius:8,padding:"8px 14px",fontSize:13 }}><span style={{ fontWeight:700,color:c.couleur }}>{c.emoji} {c.label}</span><span style={{ marginLeft:8,color:"#5a7a9a" }}>{count} pers.</span></div>;
+              })}
+            </div>
+            <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%",borderCollapse:"collapse",fontSize:13 }}>
+              <thead><tr style={{ background:"#e8edf3" }}>
+                <th style={th}>✓</th><th style={th}>Niveau</th><th style={th}>Nom 🛡️</th>
+                <th style={th}>Montant</th><th style={th}>Mail</th><th style={th}>R1</th><th style={th}>R2</th><th style={th}>R3</th>
+              </tr></thead>
+              <tbody>{impayés.map((r,i)=>(
+                <tr key={i} style={{ borderBottom:"1px solid #e8edf3",opacity:r._selected&&r._niveau!==null?1:0.45,background:r._mailManquant?"#fffde7":r._niveau===null?"#f5f5f5":"white" }}>
+                  <td style={td}>{r._niveau!==null?<input type="checkbox" checked={r._selected} onChange={()=>setImpayés(impayés.map((x,j)=>j===i?{...x,_selected:!x._selected}:x))} />:"✅"}</td>
+                  <td style={td}>{r._niveau?<><Badge niveau={r._niveau} />{!r._delaiOk&&<span style={{ marginLeft:6,fontSize:10,color:"#f57f17",fontWeight:600 }}>🕐 J+{r._joursRestants}</span>}</>:<span style={{ fontSize:11,color:"#999" }}>Terminé</span>}</td>
+                  <td style={td}>{r[mapping.nom]}</td>
+                  <td style={{ ...td,fontWeight:600,color:"#c0392b" }}>{r[mapping.montant]} €</td>
+                  <td style={td}>{r._mailManquant?<span style={{ color:"#e65100",fontSize:11,fontWeight:600 }}>⚠️ manquant</span>:<span style={{ color:"#1e7e34",fontSize:11 }}>✅</span>}</td>
+                  {["dateR1","dateR2","dateR3"].map(k=><td key={k} style={{ ...td,color:r[mapping[k]]?"#1e7e34":"#ccc",fontSize:12 }}>{r[mapping[k]]||"—"}</td>)}
+                </tr>
+              ))}</tbody>
+            </table>
+            </div>
+            <div style={{ marginTop:20 }}><Btn onClick={generateEmails} disabled={selectedCount===0}>Générer {selectedCount} mail(s) avec Claude →</Btn></div>
+          </Card>}
+
+          {step==="generation" && <Card title="Génération en cours…">
+            <div style={{ background:"#f0f4f8",borderRadius:10,padding:"16px 20px",marginBottom:20,fontSize:13 }}>
+              <div style={{ display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",justifyContent:"center" }}>
+                <Pill color="#003189" text="Données réelles" /><span>→</span>
+                <Pill color="#e65100" text="🛡️ Anonymisation" /><span>→</span>
+                <Pill color="#5a7a9a" text="API Claude (ton adapté)" /><span>→</span>
+                <Pill color="#e65100" text="🛡️ Réinsertion" /><span>→</span>
+                <Pill color="#1e7e34" text="Mail final" />
+              </div>
+            </div>
+            <div style={{ background:"#e8edf3",borderRadius:8,height:14,overflow:"hidden",marginBottom:8 }}>
+              <div style={{ background:"#003189",height:"100%",width:`${(generationProgress/selectedCount)*100}%`,transition:"width 0.4s" }} />
+            </div>
+            <div style={{ fontSize:13,color:"#5a7a9a" }}>{generationProgress} / {selectedCount} mail(s) générés</div>
+          </Card>}
+
+          {step==="envoi" && <Card title={`${emails.length} mail(s) prêt(s) à envoyer`}>
+            <div style={{ background:"#e8f5e9",border:"1px solid #a5d6a7",borderRadius:8,padding:"10px 16px",marginBottom:16,fontSize:13,color:"#2e7d32" }}>
+              🛡️ <strong>Aucune donnée personnelle n'a transité vers l'IA.</strong> Noms et mails réinsérés localement.
+            </div>
+            <div style={{ display:"flex",gap:10,marginBottom:20,flexWrap:"wrap" }}>
+              {[1,2,3].filter(n=>emails.some(e=>e.niveau===n)).map(n=>{ const c=NIVEAU_CONFIG[n]; const total=emails.filter(e=>e.niveau===n).length; const sent=emails.filter(e=>e.niveau===n&&e._sent).length;
+                return <div key={n} style={{ background:c.bg,border:`1px solid ${c.border}`,borderRadius:8,padding:"8px 14px",fontSize:13 }}><span style={{ fontWeight:700,color:c.couleur }}>{c.emoji} {c.label}</span><span style={{ marginLeft:8,color:"#5a7a9a" }}>{sent}/{total} envoyé(s)</span></div>;
+              })}
+            </div>
+            {emails.map((e,i)=>{ const c=NIVEAU_CONFIG[e.niveau]; return (
+              <div key={i} style={{ border:`2px solid ${e._sent?"#a5d6a7":c.border}`,borderRadius:10,padding:16,marginBottom:16,background:e._sent?"#f9fffe":c.bg }}>
+                <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8 }}>
+                  <div style={{ display:"flex",alignItems:"center",gap:10,flexWrap:"wrap" }}>
+                    <Badge niveau={e.niveau} />
+                    <span style={{ fontWeight:700 }}>{e.nom}</span>
+                    <span style={{ color:"#c0392b",fontWeight:600 }}>{e.montant} €</span>
+                    <span style={{ fontSize:12,color:"#5a7a9a" }}>{e.email}</span>
+                    {e._sent&&<span style={{ fontSize:12,color:"#1e7e34",fontWeight:600 }}>✅ ouvert</span>}
+                  </div>
+                  <button onClick={()=>openMailto(e,i)} style={{ background:e._sent?"#1e7e34":c.couleur,color:"white",border:"none",borderRadius:6,padding:"7px 14px",fontSize:13,cursor:"pointer",fontWeight:600 }}>
+                    📨 {e._sent?"Rouvrir Outlook":"Ouvrir dans Outlook"}
+                  </button>
+                </div>
+                <textarea rows={7} value={e._edited} onChange={ev=>setEmails(emails.map((x,j)=>j===i?{...x,_edited:ev.target.value}:x))}
+                  style={{ width:"100%",border:`1px solid ${c.border}`,borderRadius:6,padding:"10px 12px",fontSize:13,fontFamily:"inherit",resize:"vertical",boxSizing:"border-box",lineHeight:1.6,background:"white" }} />
+              </div>
+            );})}
+            <button onClick={()=>emails.forEach((e,i)=>openMailto(e,i))} style={{ background:"#003189",color:"white",border:"none",borderRadius:8,padding:"11px 22px",fontSize:14,cursor:"pointer",fontWeight:700,marginRight:12 }}>
+              📨 Ouvrir TOUS dans Outlook
+            </button>
+            <div style={{ marginTop:28,borderTop:"2px dashed #c5d0dd",paddingTop:20 }}>
+              <div style={{ fontSize:14,fontWeight:700,color:"#3a5068",marginBottom:6 }}>📅 Mise à jour Grist</div>
+              <div style={{ background:"#f8f9fc",border:"1px solid #dde3ec",borderRadius:8,padding:"10px 16px",marginBottom:12,fontSize:12 }}>
+                {[1,2,3].filter(n=>emails.some(e=>e.niveau===n)).map(n=>{ const c=NIVEAU_CONFIG[n]; const col=n===1?mapping.dateR1:n===2?mapping.dateR2:mapping.dateR3;
+                  return <div key={n} style={{ color:c.couleur,marginBottom:4 }}>{c.emoji} <strong>{emails.filter(e=>e.niveau===n).length} pers.</strong> → <code style={{ background:"#eee",padding:"1px 5px",borderRadius:3 }}>{col}</code> = {today()}</div>;
+                })}
+              </div>
+              {gristUpdateStatus==="ok"&&<div style={{ background:"#e8f5e9",border:"1px solid #a5d6a7",borderRadius:8,padding:"12px 16px",fontSize:14,color:"#1e7e34",fontWeight:600,marginBottom:12 }}>✅ Grist mis à jour avec succès !</div>}
+              {gristUpdateStatus==="error"&&<div style={{ background:"#fff0f0",border:"1px solid #ffb3b3",borderRadius:8,padding:"12px 16px",fontSize:14,color:"#c0392b",marginBottom:12 }}>⚠️ Erreur lors de la mise à jour Grist.</div>}
+              <button onClick={confirmerDansGrist} disabled={gristUpdateStatus==="loading"||gristUpdateStatus==="ok"}
+                style={{ background:gristUpdateStatus==="ok"?"#a5d6a7":gristUpdateStatus==="loading"?"#a0b4c8":"#1e7e34",color:"white",border:"none",borderRadius:8,padding:"12px 24px",fontSize:14,cursor:gristUpdateStatus==="ok"||gristUpdateStatus==="loading"?"default":"pointer",fontWeight:700 }}>
+                {gristUpdateStatus==="loading"?"Mise à jour…":gristUpdateStatus==="ok"?"✅ Grist mis à jour":`📅 Tout confirmer — ${today()}`}
+              </button>
+              <button onClick={recommencer} style={{ marginLeft:12,background:"transparent",color:"#5a7a9a",border:"1px solid #c5d0dd",borderRadius:8,padding:"12px 20px",fontSize:13,cursor:"pointer" }}>
+                🔄 Recommencer
+              </button>
+            </div>
+          </Card>}
+        </div>
+      </>}
+
+      {/* ── ONGLET IMPORT MAILS ── */}
+      {onglet==="import" && <>
+        {!connected
+          ? <div style={{ maxWidth:860,margin:"32px auto",padding:"0 24px" }}><div style={{ background:"#fff3e0",border:"1px solid #ffcc80",borderRadius:8,padding:"14px 18px",fontSize:14,color:"#e65100" }}>⚠️ Connectez-vous d'abord via l'onglet <strong>Relances → Étape 1</strong>.</div></div>
+          : <ImportMails config={config} tables={tables} columns={columns} fetchColumns={fetchColumns} selectedTable={selectedTable} setSelectedTable={setSelectedTable} />
+        }
+      </>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
