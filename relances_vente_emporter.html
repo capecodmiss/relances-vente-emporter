@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>Relances — Vente à emporter</title>
 <script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" integrity="sha512-qlEeXXoGqOA0HLrVnFEufKfMXjgA0YHa+wBmXEMZ3JCEzNRiu7MiXCsR+JBCKmBWiOkMDnkMDO1RBdPDnkFg==" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" integrity="sha512-2xAMtzkaAKKzMovOSSwbsJRZ1/jOGOlBSTmpi7ClCSpaKbVeIKS/0tMFG/MkMa3EqN3JXl7UXoqJjkLXir7Iw==" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js" integrity="sha512-ISdGbiCCWX/FiJFZbJbtMa8JLXMzb+xbkqMDmaQlNKMfNBVDA5sNfcKEjBnSJ3QJ1N47hIuqJCBRzJGiOFnSg==" crossorigin="anonymous"></script>
 <style>*,*::before,*::after{box-sizing:border-box;}body{margin:0;font-family:'Segoe UI',sans-serif;background:#f0f4f8;color:#1a2332;}input,select,textarea,button{font-family:inherit;}</style>
 </head>
 <body>
@@ -25,12 +25,24 @@ const NIVEAU_CONFIG={
   3:{label:"3ème relance",couleur:"#b71c1c",bg:"#ffebee",border:"#ef9a9a",emoji:"🔴"},
 };
 
+// ── Stockage sécurisé (sessionStorage au lieu de localStorage) ─
+// Les données bancaires ne persistent que le temps de la session navigateur.
+function getSessionValue(key, fallback) {
+  try { return sessionStorage.getItem(key) || fallback; }
+  catch { return fallback; }
+}
+function setSessionValue(key, value) {
+  try { sessionStorage.setItem(key, value); }
+  catch { /* ignore */ }
+}
+
 // ── Modèles de mails fixes (100% local, zéro IA) ─────────────
 function buildMail(niveau, nom, facture, montant, dateR1, dateR2, iban, bic) {
   const nomPropre = toNomPropre(nom);
   const d1 = gristDateToStr(dateR1) || "?";
   const d2 = gristDateToStr(dateR2) || "?";
-  const coordBanc = `Pour rappel, voici les coordonnées bancaires du Lycée Bascan :\nIBAN : ${iban}\nBIC : ${bic}`;
+  const ibanMasque = masquerIBAN(iban);
+  const coordBanc = `Pour rappel, voici les coordonnées bancaires du Lycée Bascan :\nIBAN : ${ibanMasque}\nBIC : ${bic}`;
   const sign = `Cordialement,\nLe Service Intendance`;
 
   if(niveau===1) return `Madame, Monsieur ${nomPropre},
@@ -72,6 +84,12 @@ function toNomPropre(s){
   return String(s||"").toLowerCase().replace(/(^\w|-\w)/g,c=>c.toUpperCase());
 }
 
+function masquerIBAN(iban) {
+  const clean = String(iban || "").replace(/\s/g, "");
+  if (clean.length <= 8) return clean;
+  return clean.slice(0, 4) + " •••• •••• •••• " + clean.slice(-4);
+}
+
 function gristDateToStr(v){
   if(!v)return null;
   let d;
@@ -101,6 +119,10 @@ function detectNiveau(r,c1,c2,c3){
   const j2=joursDepuis(r[c2]);
   if(!r[c3])return{niveau:3,delaiOk:j2===null||j2>=DELAI_JOURS,joursRestants:j2===null?0:Math.max(0,DELAI_JOURS-j2),dateR1:r[c1],dateR2:r[c2]};
   return null;
+}
+
+function validerEmail(email) {
+  return /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/.test(email);
 }
 
 const normalize=s=>String(s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z0-9 ]/g,"").trim();
@@ -136,6 +158,23 @@ const iS={width:"100%",border:"1px solid #c5d0dd",borderRadius:6,padding:"7px 10
 const th={padding:"6px 9px",textAlign:"left",fontWeight:600,fontSize:11,color:"#5a7a9a",textTransform:"uppercase"};
 const td={padding:"6px 9px",fontSize:12};
 
+// ── Bandeau RGPD ──────────────────────────────────────────────
+function BandeauRGPD({onAccept,accepted}){
+  if(accepted)return null;
+  return(
+    <div style={{position:"fixed",bottom:0,left:0,right:0,zIndex:1000,background:"#1a2332",color:"white",padding:"14px 20px",fontSize:12,display:"flex",alignItems:"center",gap:14,flexWrap:"wrap",boxShadow:"0 -4px 20px rgba(0,0,0,0.3)"}}>
+      <div style={{flex:1,minWidth:200}}>
+        <strong>Information sur le traitement des données</strong><br/>
+        Cet outil traite des données personnelles (noms, emails, montants) dans le cadre du recouvrement de factures de vente à emporter, conformément à la mission de service public de l'établissement (article 6.1.e du RGPD).
+        Les données sont traitées localement dans votre navigateur et ne sont transmises à aucun serveur externe.
+        Les coordonnées bancaires saisies ne sont conservées que le temps de votre session.
+        Pour toute question, contactez le DPO de l'établissement.
+      </div>
+      <button onClick={onAccept} style={{background:"#1e7e34",color:"white",border:"none",borderRadius:6,padding:"8px 16px",fontSize:12,cursor:"pointer",fontWeight:700,whiteSpace:"nowrap"}}>J'ai compris</button>
+    </div>
+  );
+}
+
 // ── Onglet Import Mails ───────────────────────────────────────
 function ImportMails({tableId,columns}){
   const[mNom,setMNom]=useState("");const[mEmail,setMEmail]=useState("");
@@ -147,7 +186,14 @@ function ImportMails({tableId,columns}){
     try{
       const raw2=await grist.docApi.fetchTable(tableId);
       const rows=raw2.id.map((id,i)=>{const r={_gristId:id};Object.keys(raw2).forEach(k=>{if(k!=="id")r[k]=raw2[k][i];});return r;});
-      setMatched(matchNoms(rows,mNom,parseMailList(raw)));
+      const parsed=parseMailList(raw);
+      const invalidEmails=parsed.filter(p=>!validerEmail(p.email));
+      if(invalidEmails.length>0){
+        setErr(`Adresses mail invalides détectées : ${invalidEmails.map(p=>p.email).join(", ")}`);
+        setLoading(false);
+        return;
+      }
+      setMatched(matchNoms(rows,mNom,parsed));
     }catch(e){setErr(e.message);}finally{setLoading(false);}
   };
 
@@ -155,6 +201,12 @@ function ImportMails({tableId,columns}){
     setStatus("loading");
     try{
       const toUp=matched.filter(r=>r._gristId&&(r._matchedEmail||r._override));
+      const invalidOverrides=toUp.filter(r=>r._override&&!validerEmail(r._override));
+      if(invalidOverrides.length>0){
+        setStatus(null);
+        setErr(`Adresses saisies invalides : ${invalidOverrides.map(r=>r._override).join(", ")}`);
+        return;
+      }
       await grist.docApi.applyUserActions([["BulkUpdateRecord",tableId,toUp.map(r=>r._gristId),{[mEmail]:toUp.map(r=>r._override||r._matchedEmail)}]]);
       setStatus("ok");
     }catch{setStatus("error");}
@@ -205,6 +257,7 @@ function ImportMails({tableId,columns}){
 
 // ═══════════════════════════════════════════════════════════════
 function App(){
+  const[rgpdAccepted,setRgpdAccepted]=useState(()=>{try{return sessionStorage.getItem("relances_rgpd")==="1";}catch{return false;}});
   const[onglet,setOnglet]=useState("relances");
   const[step,setStep]=useState("config");
   const[gristReady,setGristReady]=useState(false);
@@ -212,8 +265,8 @@ function App(){
   const[tableIdInput,setTableIdInput]=useState("");
   const[tables,setTables]=useState([]);
   const[columns,setColumns]=useState([]);
-  const[iban,setIban]=useState(()=>localStorage.getItem("relances_iban")||"");
-  const[bic,setBic]=useState(()=>localStorage.getItem("relances_bic")||"");
+  const[iban,setIban]=useState(()=>getSessionValue("relances_iban",""));
+  const[bic,setBic]=useState(()=>getSessionValue("relances_bic",""));
   const[mapping,setMapping]=useState({nom:"",facture:"",email:"",montant:"",statut:"",dateR1:"",dateR2:"",dateR3:""});
   const[filterStatut,setFilterStatut]=useState("");
   const[impayés,setImpayés]=useState([]);
@@ -221,9 +274,11 @@ function App(){
   const[error,setError]=useState("");
   const[gristStatus,setGristStatus]=useState(null);
 
+  const acceptRGPD=()=>{setRgpdAccepted(true);try{sessionStorage.setItem("relances_rgpd","1");}catch{}};
+
   useEffect(()=>{
     try{
-      grist.ready({requiredAccess:"full"});
+      grist.ready({requiredAccess:"read table"});
       setGristReady(true);
       setTimeout(async()=>{
         try{const list=await grist.docApi.listTables();if(list&&list.length)setTables(list);}
@@ -277,8 +332,6 @@ function App(){
       });
       setImpayés(avecNiveau);
 
-      // Générer les mails directement (100% local, zéro IA)
-      // Inclure TOUS les impayés sélectionnés, même sans mail
       const mails=avecNiveau
         .filter(r=>r._selected&&r._niveau!==null)
         .map(r=>({
@@ -297,6 +350,10 @@ function App(){
   };
 
   const openMailto=(e,i)=>{
+    if(e.email&&!validerEmail(e.email)){
+      setError(`Adresse mail invalide pour ${e.nom} : ${e.email}`);
+      return;
+    }
     const subject=encodeURIComponent(`Relance (${NIVEAU_CONFIG[e.niveau]?.label}) – Vente à emporter – Lycée Bascan`);
     window.open(`mailto:${e.email}?subject=${subject}&body=${encodeURIComponent(e._edited)}`);
     setEmails(prev=>prev.map((x,j)=>j===i?{...x,_sent:true}:x));
@@ -327,6 +384,9 @@ function App(){
 
   return(
     <div style={{minHeight:"100vh",background:"#f0f4f8"}}>
+      {/* Bandeau RGPD */}
+      <BandeauRGPD accepted={rgpdAccepted} onAccept={acceptRGPD}/>
+
       {/* Header */}
       <div style={{background:"#003189",color:"white",padding:"11px 18px",display:"flex",alignItems:"center",gap:10}}>
         <span style={{fontSize:20}}>📬</span>
@@ -337,7 +397,7 @@ function App(){
         <div style={{marginLeft:"auto",background:"#1e7e34",borderRadius:20,padding:"3px 9px",fontSize:10,fontWeight:600}}>🔒 100% local</div>
       </div>
       <div style={{background:"#e8f5e9",borderBottom:"1px solid #a5d6a7",padding:"4px 18px",fontSize:10,color:"#2e7d32"}}>
-        🔒 Aucune donnée ne quitte votre navigateur — zéro IA, zéro serveur externe
+        🔒 Traitement local — les données personnelles ne sont pas envoyées vers des serveurs externes. Scripts UI chargés via CDN (React, Babel).
       </div>
 
       {/* Onglets */}
@@ -364,13 +424,13 @@ function App(){
             </div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
               <Field label="🏦 IBAN">
-                <input value={iban} onChange={e=>{setIban(e.target.value);localStorage.setItem("relances_iban",e.target.value);}} placeholder="Ex: FR76..." style={iS}/>
+                <input value={iban} onChange={e=>{setIban(e.target.value);setSessionValue("relances_iban",e.target.value);}} placeholder="Ex: FR76..." style={iS}/>
               </Field>
               <Field label="BIC">
-                <input value={bic} onChange={e=>{setBic(e.target.value);localStorage.setItem("relances_bic",e.target.value);}} placeholder="Ex: TRPUFRP1XXX" style={iS}/>
+                <input value={bic} onChange={e=>{setBic(e.target.value);setSessionValue("relances_bic",e.target.value);}} placeholder="Ex: TRPUFRP1XXX" style={iS}/>
               </Field>
             </div>
-            <div style={{fontSize:10,color:"#5a7a9a",marginBottom:10}}>💾 Sauvegardés dans votre navigateur — jamais envoyés sur internet.</div>
+            <div style={{fontSize:10,color:"#5a7a9a",marginBottom:10}}>💾 Conservés uniquement le temps de votre session navigateur — supprimés à la fermeture de l'onglet.</div>
             <Field label="Table Grist">
               {tables.length>0
                 ?<select value={tableId} onChange={e=>loadTable(e.target.value)} style={iS}>
@@ -447,7 +507,6 @@ function App(){
                     <td style={td}>{r._niveau!==null?<input type="checkbox" checked={r._selected} onChange={()=>{
                       const updated=impayés.map((x,j)=>j===i?{...x,_selected:!x._selected}:x);
                       setImpayés(updated);
-                      // Recalculer les mails
                       const mails=updated.filter(r=>r._selected&&r._niveau!==null&&!r._mailManquant).map(r=>({
                         nom:r[mapping.nom],facture:r[mapping.facture]||"?",email:r[mapping.email]||"",
                         montant:r[mapping.montant]||"?",niveau:r._niveau,_gristId:r._gristId,_sent:false,
